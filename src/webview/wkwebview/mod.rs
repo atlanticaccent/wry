@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 mod file_drop;
+mod download;
 mod web_context;
 
 pub use web_context::WebContextImpl;
@@ -46,7 +47,7 @@ use crate::{
     dpi::{LogicalSize, PhysicalSize},
     window::Window,
   },
-  webview::{FileDropEvent, WebContext, WebViewAttributes},
+  webview::{FileDropEvent, WebContext, WebViewAttributes, wkwebview::download::{add_download_methods, set_download_delegate}},
   Result,
 };
 
@@ -65,6 +66,7 @@ pub struct InnerWebView {
   navigation_decide_policy_ptr: *mut Box<dyn Fn(String, bool) -> bool>,
   #[cfg(target_os = "macos")]
   file_drop_ptr: *mut (Box<dyn Fn(&Window, FileDropEvent) -> bool>, Rc<Window>),
+  download_delegate: *mut Object,
   protocol_ptrs: Vec<*mut Box<dyn Fn(&HttpRequest) -> Result<HttpResponse>>>,
 }
 
@@ -246,6 +248,7 @@ impl InnerWebView {
         Some(mut decl) => {
           #[cfg(target_os = "macos")]
           add_file_drop_methods(&mut decl);
+          // add_download_methods(&mut decl);
           decl.register()
         }
         _ => class!(WryWebView),
@@ -322,30 +325,71 @@ impl InnerWebView {
           let url = NSString(Id::from_ptr(url));
           let target_frame: id = msg_send![action, targetFrame];
           let is_main_frame: bool = msg_send![target_frame, isMainFrame];
+          let should_download: bool = msg_send![action, shouldPerformDownload];
           let handler = handler as *mut block::Block<(NSInteger,), c_void>;
 
-          let function = this.get_ivar::<*mut c_void>("function");
-          if !function.is_null() {
-            let function = &mut *(*function as *mut Box<dyn for<'s> Fn(String, bool) -> bool>);
-            match (function)(url.to_str().to_string(), is_main_frame) {
-              true => (*handler).call((1,)),
-              false => (*handler).call((0,)),
-            };
+          if should_download {
+            let has_download_handler = this.get_ivar::<*mut c_void>("HasDownloadHandler");
+            if !has_download_handler.is_null() {
+              let has_download_handler = &mut *(*has_download_handler as *mut Box<bool>);
+              if **has_download_handler {
+                (*handler).call((2,));
+              }
+            }
           } else {
-            log::warn!("WebView instance is dropped! This navigation handler shouldn't be called.");
-            (*handler).call((1,));
+            let function = this.get_ivar::<*mut c_void>("function");
+            if !function.is_null() {
+              let function = &mut *(*function as *mut Box<dyn for<'s> Fn(String, bool) -> bool>);
+              match (function)(url.to_str().to_string(), is_main_frame) {
+                true => (*handler).call((1,)),
+                false => (*handler).call((0,)),
+              };
+            } else {
+              log::warn!("WebView instance is dropped! This navigation handler shouldn't be called.");
+              (*handler).call((1,));
+            }
           }
         }
       }
 
-      let navigation_decide_policy_ptr = if attributes.navigation_handler.is_some() || attributes.new_window_req_handler.is_some() {
+      // Navigation handler
+      extern "C" fn navigation_policy_response(this: &Object, _: Sel, _: id, response: id, handler: id) {
+        unsafe {
+          let handler = handler as *mut block::Block<(NSInteger,), c_void>;
+          let can_show_mime_type: bool = msg_send![response, canShowMIMEType];
+
+          if !can_show_mime_type {
+            let has_download_handler = this.get_ivar::<*mut c_void>("HasDownloadHandler");
+            if !has_download_handler.is_null() {
+              let has_download_handler = &mut *(*has_download_handler as *mut Box<bool>);
+              if **has_download_handler {
+                (*handler).call((2,));
+                return;
+              }
+            }
+          }
+
+          (*handler).call((1,));
+        }
+      }
+
+      let (nav_handler_ptr, download_delegate) = if attributes.navigation_handler.is_some() ||
+        attributes.new_window_req_handler.is_some() ||
+        attributes.download_handlers.is_some()
+      {
         let cls = match ClassDecl::new("UIViewController", class!(NSObject)) {
           Some(mut cls) => {
             cls.add_ivar::<*mut c_void>("function");
+            cls.add_ivar::<*mut c_void>("HasDownloadHandler");
             cls.add_method(
               sel!(webView:decidePolicyForNavigationAction:decisionHandler:),
               navigation_policy as extern "C" fn(&Object, Sel, id, id, id),
             );
+            cls.add_method(
+              sel!(webView:decidePolicyForNavigationResponse:decisionHandler:),
+              navigation_policy_response as extern "C" fn(&Object, Sel, id, id, id),
+            );
+            add_download_methods(&mut cls);
             cls.register()
           }
           None => class!(UIViewController),
@@ -369,11 +413,109 @@ impl InnerWebView {
         };
         (*handler).set_ivar("function", function_ptr as *mut _ as *mut c_void);
 
+        let has_download_handler = Box::into_raw(Box::new(Box::new(attributes.download_handlers.is_some())));
+        (*handler).set_ivar("HasDownloadHandler", has_download_handler as *mut _ as *mut c_void);
+
         let _: () = msg_send![webview, setNavigationDelegate: handler];
-        function_ptr
+
+        let download_delegate = if let Some((
+          download_started_handler,
+          download_completed_builder
+        )) = attributes.download_handlers {
+          let cls = match ClassDecl::new("DownloadDelegate", class!(NSObject)) {
+            Some(mut cls) => {
+              cls.add_ivar::<*mut c_void>("started");
+              cls.add_ivar::<*mut c_void>("completed");
+              cls.add_method(
+                sel!(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:),
+                download_policy as extern "C" fn(&Object, Sel, id, id, id, id),
+              );
+              cls.add_method(
+                sel!(downloadDidFinish:),
+                download_did_finish as extern "C" fn(&Object, Sel, id)
+              );
+              cls.add_method(
+                sel!(download:didFailWithError:resumeData:),
+                download_did_fail as extern "C" fn(&Object, Sel, id, id, id)
+              );
+              cls.register()
+            }
+            None => class!(UIViewController),
+          };
+  
+          let download_delegate: id = msg_send![cls, new];
+          let download_started_ptr = Box::into_raw(Box::new(download_started_handler));
+          (*download_delegate).set_ivar("started", download_started_ptr as *mut _ as *mut c_void);
+          let download_completed_handler = download_completed_builder();
+          let download_completed_ptr = Box::into_raw(Box::new(download_completed_handler));
+          (*download_delegate).set_ivar("completed", download_completed_ptr as *mut _ as *mut c_void);
+  
+          set_download_delegate(handler, download_delegate);
+  
+          handler
+        } else {
+          null_mut()
+        };
+
+        (function_ptr, download_delegate)
       } else {
-        null_mut()
+        (null_mut(), null_mut())
       };
+
+      // Download handler
+      extern "C" fn download_policy(this: &Object, _: Sel, download: id, _: id, suggested_path: id, handler: id) {
+        unsafe {
+          let request: id = msg_send![download, originalRequest];
+          let url: id = msg_send![request, URL];
+          let url: id = msg_send![url, absoluteString];
+          let url = NSString(Id::from_ptr(url));
+          let path = NSString(Id::from_ptr(suggested_path));
+          let mut path = path.to_str().to_string();
+          let handler = handler as *mut block::Block<(id,), c_void>;
+          
+          let function = this.get_ivar::<*mut c_void>("started");
+          if !function.is_null() {
+            let function = &mut *(*function as *mut Box<dyn for<'s> FnMut(String, &mut String) -> bool>);
+            match (function)(url.to_str().to_string(), &mut path) {
+              true => {
+                // let nsstring: id = msg_send![class!(NSString), alloc];
+                // let nsstring = msg_send![nsstring, initWithBytes:path.as_ptr() length:path.len() encoding:UTF8_ENCODING];
+                let nsurl: id = msg_send![class!(NSURL), fileURLWithPath: NSString::new(&path) isDirectory: false];
+                (*handler).call((nsurl,))
+              },
+              false => (*handler).call((null_mut(),)),
+            };
+          } else {
+            log::warn!("WebView instance is dropped! This navigation handler shouldn't be called.");
+            (*handler).call((null_mut(),));
+          }
+        }
+      }
+
+      extern "C" fn download_did_finish(this: &Object, _: Sel, _: id) {
+        unsafe {
+          let function = this.get_ivar::<*mut c_void>("completed");
+          if !function.is_null() {
+            let function = &mut *(*function as *mut Box<dyn for<'s> Fn(String, bool) -> bool>);
+            function(String::new(), true);
+          }
+        }
+      }
+
+      extern "C" fn download_did_fail(this: &Object, _: Sel, _: id, error: id, _: id) {
+        unsafe {
+          let description: id = msg_send![error, localizedDescription];
+          let description = NSString(Id::from_ptr(description)).to_str().to_string();
+
+          eprintln!("{}", description);
+
+          let function = this.get_ivar::<*mut c_void>("completed");
+          if !function.is_null() {
+            let function = &mut *(*function as *mut Box<dyn for<'s> Fn(String, bool) -> bool>);
+            function(String::new(), false);
+          }
+        }
+      }
 
       // File drop handling
       #[cfg(target_os = "macos")]
@@ -399,6 +541,7 @@ impl InnerWebView {
         navigation_decide_policy_ptr,
         #[cfg(target_os = "macos")]
         file_drop_ptr,
+        download_delegate,
         protocol_ptrs,
       };
 
@@ -572,6 +715,10 @@ impl Drop for InnerWebView {
       #[cfg(target_os = "macos")]
       if !self.file_drop_ptr.is_null() {
         let _ = Box::from_raw(self.file_drop_ptr);
+      }
+
+      if !self.download_delegate.is_null() {
+        let _ = self.download_delegate.drop_in_place();
       }
 
       for ptr in self.protocol_ptrs.iter() {

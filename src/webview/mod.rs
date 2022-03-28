@@ -126,10 +126,18 @@ pub struct WebViewAttributes {
   /// allow to nivagate and false is not.
   pub navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
 
-  /// Set a download handler to decide if incoming download is allowed.
+  /// Set a download handlers to manage incoming downloads.
   ///
-  /// The closure take a `String` parameter as url and return `bool` to allow or deny.
-  pub download_handler: Option<Box<dyn Fn(String) -> bool>>,
+  /// The first closure takes two parameters - the first is a `String` representing the url being downloaded from and and the 
+  /// second is a mutable `String` reference that (possibly) represents where the file will be downloaded to. The latter 
+  /// parameter can be used to set the download location by assigning a new path string to it - the assigned path _must_ be 
+  /// absolute, and (on Windows) cannot include a UNC prefix. The closure returns a `bool` to allow or deny the download.
+  /// The second closure is fired when the download completes, with a `String` representing the path to where the download was
+  /// saved and a `bool` indicating if the download succeeded.
+  pub download_handlers: Option<(
+    Box<dyn FnMut(String, &mut String) -> bool>,
+    Box<dyn Fn() -> Box<dyn Fn(String, bool) + 'static> + 'static>
+  )>,
 
   /// Set a new window handler to decide if incoming url is allowed to open in a new window.
   ///
@@ -167,7 +175,7 @@ impl Default for WebViewAttributes {
       ipc_handler: None,
       file_drop_handler: None,
       navigation_handler: None,
-      download_handler: None,
+      download_handlers: None,
       new_window_req_handler: None,
       clipboard: false,
       devtool: false,
@@ -339,8 +347,15 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// The closure takes a `String` parameter as url and return `bool` to determine if the 
   /// download is allowed or not.
-  pub fn with_download_handler(mut self, callback: impl Fn(String) -> bool + 'static) -> Self {
-    self.webview.download_handler = Some(Box::new(callback));
+  pub fn with_download_handler(
+    mut self,
+    started_callback: impl FnMut(String, &mut String) -> bool + 'static,
+    complete_callback_builder: impl Fn() -> Box<dyn Fn(String, bool) + 'static> + 'static
+  ) -> Self {
+    self.webview.download_handlers = Some((
+      Box::new(started_callback),
+      Box::new(complete_callback_builder)
+    ));
     self
   }
 
