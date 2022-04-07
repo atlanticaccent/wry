@@ -373,7 +373,7 @@ impl InnerWebView {
         }
       }
 
-      let (nav_handler_ptr, download_delegate) = if attributes.navigation_handler.is_some() ||
+      let (navigation_decide_policy_ptr, download_delegate) = if attributes.navigation_handler.is_some() ||
         attributes.new_window_req_handler.is_some() ||
         attributes.download_handlers.is_some()
       {
