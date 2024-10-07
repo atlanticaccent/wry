@@ -57,4 +57,15 @@ pub enum Error {
   #[cfg(target_os = "android")]
   #[error(transparent)]
   CrossBeamRecvError(#[from] crossbeam_channel::RecvError),
+  
+  #[cfg(target_os = "linux")]
+  #[error(transparent)]
+  CairoError(#[from] cairo::Error),
+  #[cfg(target_os = "linux")]
+  #[error(transparent)]
+  CairoIoError(#[from] cairo::IoError),
+
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  #[error("Could not obtain screenshot from webview")]
+  NilScreenshot()
 }
